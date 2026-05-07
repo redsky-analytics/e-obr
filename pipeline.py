@@ -19,10 +19,16 @@ Commands:
     list                print all distinct assets present in the GCS source
     inspect   <asset>   dump the Parquet schema of every partition file for an
                         asset and flag any cross-file schema differences (debug)
+    view      <asset>   interactively page through the features Parquet for an
+                        asset (Enter=next, p=prev, g<n>=goto row, q=quit)
 
 Flags:
     --local             write features to LOCAL_OUTPUT_DIR/asset=<A>/data.parquet
                         instead of GCS (works for `run` and `all`)
+    --whole             allocate prev/post windows for every valid row at once
+                        and write a single row group, instead of streaming in
+                        CHUNK_SIZE chunks. Faster (no per-chunk overhead) but
+                        requires ~CHUNK_SIZE × N_chunks more memory.
 
 The features Parquets are written Hive-partitioned by asset:
     gs://<GCS_BUCKET>/<GCS_PREFIX>/asset=<A>/data.parquet
@@ -167,7 +173,7 @@ def _normalize_trade_date(t):
 def _log(asset, msg):
     print(f"[{asset}] {msg}", flush=True)
 
-def run_one(asset, local=False):
+def run_one(asset, local=False, whole=False):
     fs = gcs()
 
     _log(asset, "glob source partitions…")
@@ -195,23 +201,31 @@ def run_one(asset, local=False):
     t_dl = time.time() - t0
     _log(asset, f"dl + sort {t_dl:.1f}s")
 
-    t1 = time.time()
     _log(asset, "scanning for valid windows…")
+    t_kernel = 0.0
+    t_write = 0.0
+
     spread = tbl.column("spread").to_numpy(zero_copy_only=False)
     if spread.dtype != np.float64:
         spread = spread.astype(np.float64)
+
+    t = time.time()
     valid_idx = find_valid_indices(spread, PREV_N, POST_N)
+    t_kernel += time.time() - t
+
     n_valid = valid_idx.size
     if n_valid == 0:
         _log(asset, f"dl {t_dl:.1f}s, no valid windows")
         return
     _log(asset, f"  {n_valid:,} windows kept of {tbl.num_rows:,} input rows")
+
+    t1 = time.time()
     sliced = tbl.take(pa.array(valid_idx))
     del tbl
     if "asset" in sliced.column_names:
         sliced = sliced.drop(["asset"])
-    t_proc = time.time() - t1
-    _log(asset, f"valid-scan + filter {t_proc:.1f}s")
+    t_filter = time.time() - t1
+    _log(asset, f"filter {t_filter:.1f}s")
 
     # Set up the output sink (local tmp file or GCS handle)
     if local:
@@ -225,16 +239,20 @@ def run_one(asset, local=False):
         sink = fs.open(remote, "wb")
         dest_uri = f"gs://{remote}"
 
+    chunk_size = n_valid if whole else CHUNK_SIZE
+    n_chunks = (n_valid + chunk_size - 1) // chunk_size
     approx_mb_total = n_valid * (PREV_N + POST_N) * 4 / 1e6   # float32
-    n_chunks = (n_valid + CHUNK_SIZE - 1) // CHUNK_SIZE
-    _log(asset, f"writing {n_valid:,} rows in {n_chunks} chunk(s) of {CHUNK_SIZE:,} (~{approx_mb_total:.0f} MB uncompressed total) → {dest_uri}")
+    mode = "whole" if whole else "chunked"
+    _log(asset, f"writing {n_valid:,} rows in {n_chunks} {mode} chunk(s) of {chunk_size:,} (~{approx_mb_total:.0f} MB uncompressed total) → {dest_uri}")
 
     t2 = time.time()
     writer = None
     try:
-        for chunk_start in range(0, n_valid, CHUNK_SIZE):
-            chunk_stop = min(chunk_start + CHUNK_SIZE, n_valid)
+        for chunk_start in range(0, n_valid, chunk_size):
+            chunk_stop = min(chunk_start + chunk_size, n_valid)
             n_chunk = chunk_stop - chunk_start
+
+            t = time.time()
             prev_chunk, post_chunk = fill_windows_chunk(
                 spread, valid_idx, chunk_start, chunk_stop, PREV_N, POST_N
             )
@@ -253,9 +271,14 @@ def run_one(asset, local=False):
                     ),
                 )
             )
+            t_kernel += time.time() - t
+
+            t = time.time()
             if writer is None:
                 writer = pq.ParquetWriter(sink, chunk_tbl.schema, compression="zstd")
             writer.write_table(chunk_tbl)
+            t_write += time.time() - t
+
             _log(asset, f"  wrote {chunk_stop:,}/{n_valid:,} rows")
     finally:
         if writer is not None:
@@ -268,7 +291,10 @@ def run_one(asset, local=False):
 
     t_up = time.time() - t2
     _log(asset, f"up {t_up:.1f}s  ({approx_mb_total / max(t_up, 0.1):.0f} MB/s) → {dest_uri}")
-    _log(asset, f"DONE  dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s")
+    _log(
+        asset,
+        f"DONE  dl {t_dl:.1f}s  filter {t_filter:.1f}s  numba {t_kernel:.1f}s  write {t_write:.1f}s  total-up {t_up:.1f}s",
+    )
 
 # ============================================================================
 # Inspect:  dump per-file Parquet schemas, surface cross-file mismatches
@@ -304,6 +330,96 @@ def inspect_asset(asset):
         print(f"\nOK: all files share one schema")
 
 # ============================================================================
+# View:  interactive pager over an asset's features Parquet
+# ============================================================================
+def _fmt_window(arr, head=3, tail=3):
+    """Render a long float array as 'head … tail' for legibility."""
+    if arr is None:
+        return "None"
+    n = len(arr)
+    if n <= head + tail + 1:
+        return "[" + ", ".join(f"{x:.4g}" for x in arr) + "]"
+    parts = [f"{x:.4g}" for x in arr[:head]] + ["…"] + [f"{x:.4g}" for x in arr[-tail:]]
+    return "[" + ", ".join(parts) + f"]  (n={n})"
+
+def view_asset(asset, local=False):
+    if local:
+        path = LOCAL_OUTPUT_DIR / f"asset={asset}" / "data.parquet"
+        if not path.exists():
+            print(f"not found: {path}")
+            return
+        pf = pq.ParquetFile(str(path))
+        src = str(path)
+    else:
+        remote = f"{GCS_BUCKET}/{GCS_PREFIX}/asset={asset}/data.parquet"
+        pf = pq.ParquetFile(remote, filesystem=gcs())
+        src = f"gs://{remote}"
+
+    n_rows = pf.metadata.num_rows
+    cols = pf.schema_arrow.names
+    print(f"asset={asset}   {src}")
+    print(f"{n_rows:,} rows  ·  cols: {', '.join(cols)}")
+    print(f"row groups: {pf.num_row_groups}  ·  schema:")
+    for fld in pf.schema_arrow:
+        print(f"  {fld.name}: {fld.type}")
+    print()
+
+    # Read the small "key" columns once for fast paging; the heavy windows
+    # are read on demand per page so we don't load N × 800 floats up front.
+    key_cols = [c for c in cols if c not in ("prev_30", "post_50")]
+    key_tbl = pf.read(columns=key_cols)
+    has_prev = "prev_30" in cols
+    has_post = "post_50" in cols
+
+    page = 10
+    pos = 0
+    while True:
+        end = min(pos + page, n_rows)
+        # Read just this slice of the heavy columns
+        prev_slice = post_slice = None
+        if has_prev or has_post:
+            heavy_cols = [c for c in ("prev_30", "post_50") if c in cols]
+            heavy = pf.read(columns=heavy_cols).slice(pos, end - pos)
+            if has_prev:
+                prev_slice = heavy.column("prev_30").to_pylist()
+            if has_post:
+                post_slice = heavy.column("post_50").to_pylist()
+
+        for offset, i in enumerate(range(pos, end)):
+            line_parts = [f"[{i:>10,}]"]
+            for c in key_cols:
+                v = key_tbl.column(c)[i].as_py()
+                if isinstance(v, float):
+                    line_parts.append(f"{c}={v:.6g}")
+                else:
+                    line_parts.append(f"{c}={v}")
+            if prev_slice is not None:
+                line_parts.append(f"prev_30={_fmt_window(prev_slice[offset])}")
+            if post_slice is not None:
+                line_parts.append(f"post_50={_fmt_window(post_slice[offset])}")
+            print("  " + "  ".join(line_parts))
+
+        if end >= n_rows:
+            print(f"\n--- end of data ({n_rows:,} rows) ---")
+            break
+        try:
+            cmd = input(f"\n[{pos:,}-{end-1:,} / {n_rows:,}]  Enter/n=next  p=prev  g<n>=goto  q=quit > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if cmd in ("q", "quit"):
+            break
+        elif cmd == "p":
+            pos = max(0, pos - page)
+        elif cmd.startswith("g"):
+            try:
+                pos = max(0, min(int(cmd[1:].strip()), n_rows - 1))
+            except ValueError:
+                print("  bad goto — use e.g. 'g 12345'")
+        else:
+            pos = end
+
+# ============================================================================
 # External table:  CREATE OR REPLACE EXTERNAL TABLE over the GCS features
 # ============================================================================
 def create_external_table():
@@ -325,7 +441,8 @@ def create_external_table():
 # ============================================================================
 def main(argv):
     local = "--local" in argv
-    argv = [a for a in argv if a != "--local"]
+    whole = "--whole" in argv
+    argv = [a for a in argv if a not in ("--local", "--whole")]
 
     if len(argv) < 2:
         print(__doc__)
@@ -337,11 +454,12 @@ def main(argv):
     elif cmd == "all":
         assets = list_assets()
         dest = "local disk" if local else "GCS"
-        print(f"[all] {len(assets)} assets ({dest}): {', '.join(assets)}", flush=True)
+        mode = "whole" if whole else "chunked"
+        print(f"[all] {len(assets)} assets ({dest}, {mode}): {', '.join(assets)}", flush=True)
         for n, a in enumerate(assets, 1):
             print(f"\n[all] === {n}/{len(assets)}: {a} ===", flush=True)
             try:
-                run_one(a, local=local)
+                run_one(a, local=local, whole=whole)
             except Exception as e:
                 print(f"FAILED {a}: {e!r}", flush=True)
     elif cmd == "external":
@@ -349,14 +467,19 @@ def main(argv):
         print(f"defined external table {name}")
     elif cmd == "run":
         if len(argv) < 3:
-            print(f"usage: {argv[0]} run <asset> [--local]")
+            print(f"usage: {argv[0]} run <asset> [--local] [--whole]")
             return
-        run_one(argv[2], local=local)
+        run_one(argv[2], local=local, whole=whole)
     elif cmd == "inspect":
         if len(argv) < 3:
             print(f"usage: {argv[0]} inspect <asset>")
             return
         inspect_asset(argv[2])
+    elif cmd == "view":
+        if len(argv) < 3:
+            print(f"usage: {argv[0]} view <asset> [--local]")
+            return
+        view_asset(argv[2], local=local)
     else:
         print(f"unknown command: {cmd}")
         print(__doc__)
