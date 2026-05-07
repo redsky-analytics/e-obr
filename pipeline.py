@@ -368,22 +368,44 @@ def view_asset(asset, local=False):
     # are read on demand per page so we don't load N × 800 floats up front.
     key_cols = [c for c in cols if c not in ("prev_30", "post_50")]
     key_tbl = pf.read(columns=key_cols)
+    heavy_cols = [c for c in ("prev_30", "post_50") if c in cols]
     has_prev = "prev_30" in cols
     has_post = "post_50" in cols
+
+    # Reading all heavy rows in one shot overflows int32 indexing inside pyarrow
+    # for FixedSizeList values arrays > ~2B elements (8.3M × 300 already does).
+    # So compute row-group boundaries up front and read only the row groups that
+    # cover the current page. Cache the last single-rg read so paging within a
+    # row group doesn't re-read it.
+    rg_starts = [0]
+    for i in range(pf.num_row_groups):
+        rg_starts.append(rg_starts[-1] + pf.metadata.row_group(i).num_rows)
+    cache = {"rgs": None, "tbl": None}
+
+    def read_heavy_slice(start, stop):
+        if not heavy_cols or start >= stop:
+            return None
+        rgs = tuple(
+            i for i in range(pf.num_row_groups)
+            if rg_starts[i + 1] > start and rg_starts[i] < stop
+        )
+        if not rgs:
+            return None
+        if cache["rgs"] == rgs:
+            tbl = cache["tbl"]
+        else:
+            tbl = pf.read_row_groups(list(rgs), columns=heavy_cols)
+            cache["rgs"] = rgs
+            cache["tbl"] = tbl
+        return tbl.slice(start - rg_starts[rgs[0]], stop - start)
 
     page = 10
     pos = 0
     while True:
         end = min(pos + page, n_rows)
-        # Read just this slice of the heavy columns
-        prev_slice = post_slice = None
-        if has_prev or has_post:
-            heavy_cols = [c for c in ("prev_30", "post_50") if c in cols]
-            heavy = pf.read(columns=heavy_cols).slice(pos, end - pos)
-            if has_prev:
-                prev_slice = heavy.column("prev_30").to_pylist()
-            if has_post:
-                post_slice = heavy.column("post_50").to_pylist()
+        heavy = read_heavy_slice(pos, end)
+        prev_slice = heavy.column("prev_30").to_pylist() if (heavy is not None and has_prev) else None
+        post_slice = heavy.column("post_50").to_pylist() if (heavy is not None and has_post) else None
 
         for offset, i in enumerate(range(pos, end)):
             line_parts = [f"[{i:>10,}]"]
