@@ -45,7 +45,7 @@ LOCATION         = os.environ.get("BQ_LOCATION", "US")
 OUTPUT_TABLE     = f"{BQ_DATASET}.Orderbook_Windows"
 
 # Input: Hive-partitioned Parquet written by export_example.sql
-SOURCE_BUCKET    = os.environ["SOURCE_BUCKET"]
+SOURCE_BUCKET    = "bkt-pr-usc1-use5-2664-cdrdsml-dflt"
 SOURCE_PREFIX    = os.environ.get("SOURCE_PREFIX", "downsampled_orderbook")
 
 # Output: features Parquet (queried via the external table)
