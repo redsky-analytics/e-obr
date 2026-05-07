@@ -29,6 +29,11 @@ Flags:
                         and write a single row group, instead of streaming in
                         CHUNK_SIZE chunks. Faster (no per-chunk overhead) but
                         requires ~CHUNK_SIZE × N_chunks more memory.
+    --compression X     codec for the output Parquet; one of zstd | snappy |
+                        lz4 | none. Default is zstd (best ratio, slowest CPU).
+                        snappy/lz4 are 5-10× faster to write — useful when
+                        the spread windows compress so well that zstd CPU
+                        time dominates.
 
 The features Parquets are written Hive-partitioned by asset:
     gs://<GCS_BUCKET>/<GCS_PREFIX>/asset=<A>/data.parquet
@@ -173,8 +178,10 @@ def _normalize_trade_date(t):
 def _log(asset, msg):
     print(f"[{asset}] {msg}", flush=True)
 
-def run_one(asset, local=False, whole=False):
+def run_one(asset, local=False, whole=False, compression="zstd"):
     fs = gcs()
+    pq_compression = None if compression == "none" else compression
+    t_run_start = time.time()
 
     _log(asset, "glob source partitions…")
     files = fs.glob(f"{SOURCE_BUCKET}/{SOURCE_PREFIX}/trade_date=*/asset={asset}/*.parquet")
@@ -275,7 +282,7 @@ def run_one(asset, local=False, whole=False):
 
             t = time.time()
             if writer is None:
-                writer = pq.ParquetWriter(sink, chunk_tbl.schema, compression="zstd")
+                writer = pq.ParquetWriter(sink, chunk_tbl.schema, compression=pq_compression)
             writer.write_table(chunk_tbl)
             t_write += time.time() - t
 
@@ -290,11 +297,18 @@ def run_one(asset, local=False, whole=False):
         tmp_path.rename(dest_path)
 
     t_up = time.time() - t2
-    _log(asset, f"up {t_up:.1f}s  ({approx_mb_total / max(t_up, 0.1):.0f} MB/s) → {dest_uri}")
-    _log(
-        asset,
-        f"DONE  dl {t_dl:.1f}s  filter {t_filter:.1f}s  numba {t_kernel:.1f}s  write {t_write:.1f}s  total-up {t_up:.1f}s",
-    )
+    _log(asset, f"up {t_up:.1f}s  ({approx_mb_total / max(t_up, 0.1):.0f} MB/s uncompressed) → {dest_uri}")
+
+    t_load = t_dl
+    t_process = t_filter + t_kernel
+    t_store = t_write
+    t_total = time.time() - t_run_start
+    _log(asset, "")
+    _log(asset, f"DONE")
+    _log(asset, f"  load    {t_load:>6.1f}s   (read {len(files)} file(s) + concat + sort)")
+    _log(asset, f"  process {t_process:>6.1f}s   (filter {t_filter:.1f}s + numba {t_kernel:.1f}s, {n_valid:,} rows)")
+    _log(asset, f"  store   {t_store:>6.1f}s   ({compression}, {approx_mb_total:.0f} MB → disk)")
+    _log(asset, f"  total   {t_total:>6.1f}s")
 
 # ============================================================================
 # Inspect:  dump per-file Parquet schemas, surface cross-file mismatches
@@ -464,6 +478,18 @@ def create_external_table():
 def main(argv):
     local = "--local" in argv
     whole = "--whole" in argv
+    compression = "zstd"
+    if "--compression" in argv:
+        i = argv.index("--compression")
+        if i + 1 < len(argv):
+            compression = argv[i + 1]
+            del argv[i:i + 2]
+        else:
+            print("--compression needs a value (zstd|snappy|lz4|none)")
+            return
+    if compression not in ("zstd", "snappy", "lz4", "none"):
+        print(f"invalid --compression: {compression}")
+        return
     argv = [a for a in argv if a not in ("--local", "--whole")]
 
     if len(argv) < 2:
@@ -477,11 +503,11 @@ def main(argv):
         assets = list_assets()
         dest = "local disk" if local else "GCS"
         mode = "whole" if whole else "chunked"
-        print(f"[all] {len(assets)} assets ({dest}, {mode}): {', '.join(assets)}", flush=True)
+        print(f"[all] {len(assets)} assets ({dest}, {mode}, {compression}): {', '.join(assets)}", flush=True)
         for n, a in enumerate(assets, 1):
             print(f"\n[all] === {n}/{len(assets)}: {a} ===", flush=True)
             try:
-                run_one(a, local=local, whole=whole)
+                run_one(a, local=local, whole=whole, compression=compression)
             except Exception as e:
                 print(f"FAILED {a}: {e!r}", flush=True)
     elif cmd == "external":
@@ -489,9 +515,9 @@ def main(argv):
         print(f"defined external table {name}")
     elif cmd == "run":
         if len(argv) < 3:
-            print(f"usage: {argv[0]} run <asset> [--local] [--whole]")
+            print(f"usage: {argv[0]} run <asset> [--local] [--whole] [--compression X]")
             return
-        run_one(argv[2], local=local, whole=whole)
+        run_one(argv[2], local=local, whole=whole, compression=compression)
     elif cmd == "inspect":
         if len(argv) < 3:
             print(f"usage: {argv[0]} inspect <asset>")
