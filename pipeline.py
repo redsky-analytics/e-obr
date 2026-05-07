@@ -1,46 +1,54 @@
 """
-Orderbook windowing pipeline (per-asset).
+Orderbook windowing pipeline (per-asset, in-memory).
 
-For every row i in Downsampled_Orderbook (sorted by nanoseconds_start, seq_nbr
-within each asset) where the previous PREV_N spreads and the next POST_N
-spreads contain no nulls, emit:
+Source data is the Hive-partitioned Parquet export written by export_example.sql:
+    gs://<SOURCE_BUCKET>/<SOURCE_PREFIX>/trade_date=YYYY-MM-DD/asset=<A>/part-*.parquet
+
+For every row i in an asset's concatenated stream (sorted by nanoseconds_start,
+seq_nbr) where the previous PREV_N spreads and the next POST_N spreads contain
+no nulls, emit:
     prev_30 = spreads[i - PREV_N + 1 .. i]   (chronological, includes self)
     post_50 = spreads[i .. i + POST_N - 1]   (chronological, includes self)
 
-Stages (run independently or end-to-end):
-    download <asset>   pull the asset's slice from BigQuery → local Parquet
-    process  <asset>   read local Parquet → numba kernel → features Parquet
-    upload   <asset>   push features Parquet to GCS
-    run      <asset>   download + process + upload + cleanup local files
-    all                run for every asset, sequentially
-    load               LOAD all GCS Parquets into the final BigQuery table
-    list               print all distinct assets
+One asset at a time, fully in memory (largest asset is ~500MB Parquet).
+
+Commands:
+    run       <asset>   read GCS → numba kernel → write features back to GCS
+    all                 run for every asset, sequentially
+    external            CREATE OR REPLACE EXTERNAL TABLE over the features Parquets
+    list                print all distinct assets present in the GCS source
+
+The features Parquets are written Hive-partitioned by asset:
+    gs://<GCS_BUCKET>/<GCS_PREFIX>/asset=<A>/data.parquet
+The `asset` column is omitted from the file payload — BigQuery's hive partition
+discovery re-attaches it from the path, which avoids the partition/column name
+collision an external table would otherwise reject.
 """
 
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import gcsfs
 from numba import njit
-from google.cloud import bigquery, bigquery_storage_v1
-from google.cloud.bigquery_storage_v1 import types
+from google.cloud import bigquery
 
 # ============================================================================
 # CONFIG  — edit these
 # ============================================================================
 PROJECT          = "your_project"
 LOCATION         = "US"
-ORDERBOOK_TABLE  = "your_project.your_dataset.Downsampled_Orderbook"
 OUTPUT_TABLE     = "your_project.your_dataset.Orderbook_Windows"
+
+# Input: Hive-partitioned Parquet written by export_example.sql
+SOURCE_BUCKET    = "bkt-pr-usc1-use5-2664-cdrdsml-dflt"
+SOURCE_PREFIX    = "downsampled_orderbook"
+
+# Output: features Parquet (consumed by the final BQ load)
 GCS_BUCKET       = "your_bucket"
 GCS_PREFIX       = "orderbook_windows"
-
-LOCAL_INPUT_DIR  = Path("./data/orderbook")
-LOCAL_OUTPUT_DIR = Path("./data/features")
 
 PREV_N = 300
 POST_N = 500
@@ -99,10 +107,10 @@ def build_windows(spread, prev_n, post_n):
     return row_idx, prev_out, post_out
 
 # ============================================================================
-# BigQuery clients (lazy)
+# Clients (lazy)
 # ============================================================================
 _bq_client = None
-_bqs_client = None
+_gcs_fs = None
 
 def bq():
     global _bq_client
@@ -110,161 +118,85 @@ def bq():
         _bq_client = bigquery.Client(project=PROJECT, location=LOCATION)
     return _bq_client
 
-def bqs():
-    global _bqs_client
-    if _bqs_client is None:
-        _bqs_client = bigquery_storage_v1.BigQueryReadClient()
-    return _bqs_client
+def gcs():
+    global _gcs_fs
+    if _gcs_fs is None:
+        _gcs_fs = gcsfs.GCSFileSystem(project=PROJECT)
+    return _gcs_fs
 
 # ============================================================================
-# Download:  BQ → local Parquet (sorted by nanoseconds_start, seq_nbr)
+# Asset listing
 # ============================================================================
 def list_assets():
-    rows = bq().query(
-        f"SELECT DISTINCT asset FROM `{ORDERBOOK_TABLE}` ORDER BY asset"
-    ).result()
-    return [r.asset for r in rows]
-
-def download_asset(asset):
-    out_path = LOCAL_INPUT_DIR / f"asset={asset}" / "data.parquet"
-    if out_path.exists():
-        return out_path
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sql = f"""
-        SELECT asset, trade_date, nanoseconds_start, seq_nbr, spread
-        FROM `{ORDERBOOK_TABLE}`
-        WHERE asset = @asset
-        ORDER BY nanoseconds_start, seq_nbr
-    """
-    job = bq().query(
-        sql,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[bigquery.ScalarQueryParameter("asset", "STRING", asset)]
-        ),
-    )
-    job.result()
-    dest = job.destination
-
-    session = bqs().create_read_session(
-        parent=f"projects/{PROJECT}",
-        read_session=types.ReadSession(
-            table=f"projects/{dest.project}/datasets/{dest.dataset_id}/tables/{dest.table_id}",
-            data_format=types.DataFormat.ARROW,
-        ),
-        max_stream_count=1,   # single stream preserves ORDER BY
-    )
-    if not session.streams:
-        return None
-
-    reader = bqs().read_rows(session.streams[0].name)
-    writer = None
-    tmp_path = out_path.with_suffix(".parquet.tmp")
-    for batch in reader.rows(session).to_arrow_iterable():
-        if writer is None:
-            writer = pq.ParquetWriter(tmp_path, batch.schema, compression="zstd")
-        writer.write_batch(batch)
-    if writer is not None:
-        writer.close()
-        tmp_path.rename(out_path)
-    return out_path
+    fs = gcs()
+    paths = fs.glob(f"{SOURCE_BUCKET}/{SOURCE_PREFIX}/trade_date=*/asset=*")
+    return sorted({p.split("asset=", 1)[1].rstrip("/") for p in paths if "asset=" in p})
 
 # ============================================================================
-# Process:  local Parquet → numba kernel → features Parquet
+# Per-asset pipeline:  GCS Parquet → numba kernel → GCS features Parquet
 # ============================================================================
-def process_asset(asset):
-    in_path  = LOCAL_INPUT_DIR  / f"asset={asset}" / "data.parquet"
-    out_path = LOCAL_OUTPUT_DIR / f"asset={asset}" / "data.parquet"
-    if not in_path.exists():
-        raise FileNotFoundError(in_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+def run_one(asset):
+    fs = gcs()
 
-    tbl = pq.read_table(in_path)
-    if tbl.num_rows == 0:
-        return None
+    t0 = time.time()
+    files = fs.glob(f"{SOURCE_BUCKET}/{SOURCE_PREFIX}/trade_date=*/asset={asset}/*.parquet")
+    if not files:
+        print(f"[{asset}] no orderbook data")
+        return
+    tables = [pq.read_table(f, filesystem=fs) for f in files]
+    tbl = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    tbl = tbl.sort_by([("nanoseconds_start", "ascending"), ("seq_nbr", "ascending")])
+    t_dl = time.time() - t0
 
+    t1 = time.time()
     spread = tbl.column("spread").to_numpy(zero_copy_only=False)
     if spread.dtype != np.float64:
         spread = spread.astype(np.float64)
-
     row_idx, prev_w, post_w = build_windows(spread, PREV_N, POST_N)
     if row_idx.size == 0:
-        return None
-
+        print(f"[{asset}] dl {t_dl:.1f}s, no valid windows")
+        return
     sliced = tbl.take(pa.array(row_idx))
-    prev_arr = pa.FixedSizeListArray.from_arrays(
-        pa.array(prev_w.ravel(), pa.float64()), PREV_N
+    if "asset" in sliced.column_names:
+        sliced = sliced.drop(["asset"])
+    out = sliced.append_column(
+        "prev_30",
+        pa.FixedSizeListArray.from_arrays(pa.array(prev_w.ravel(), pa.float64()), PREV_N),
     )
-    post_arr = pa.FixedSizeListArray.from_arrays(
-        pa.array(post_w.ravel(), pa.float64()), POST_N
+    out = out.append_column(
+        "post_50",
+        pa.FixedSizeListArray.from_arrays(pa.array(post_w.ravel(), pa.float64()), POST_N),
     )
-    out = sliced.append_column("prev_30", prev_arr)
-    out = out.append_column("post_50", post_arr)
+    t_proc = time.time() - t1
 
-    tmp_path = out_path.with_suffix(".parquet.tmp")
-    pq.write_table(out, tmp_path, compression="zstd")
-    tmp_path.rename(out_path)
-    return out_path
-
-# ============================================================================
-# Upload:  local Parquet → GCS
-# ============================================================================
-def upload_asset(asset):
-    fs = gcsfs.GCSFileSystem(project=PROJECT)
-    local  = LOCAL_OUTPUT_DIR / f"asset={asset}" / "data.parquet"
+    t2 = time.time()
     remote = f"{GCS_BUCKET}/{GCS_PREFIX}/asset={asset}/data.parquet"
-    fs.put_file(str(local), remote)
-    return f"gs://{remote}"
+    with fs.open(remote, "wb") as f:
+        pq.write_table(out, f, compression="zstd")
+    t_up = time.time() - t2
+
+    print(f"[{asset}] dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s  → gs://{remote}")
 
 # ============================================================================
-# Final load:  GCS → BigQuery (one big partitioned table)
+# External table:  CREATE OR REPLACE EXTERNAL TABLE over the GCS features
 # ============================================================================
-def load_to_bq():
-    job = bq().load_table_from_uri(
-        f"gs://{GCS_BUCKET}/{GCS_PREFIX}/asset=*/data.parquet",
-        OUTPUT_TABLE,
-        job_config=bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.PARQUET,
-            write_disposition="WRITE_TRUNCATE",
-            hive_partitioning=bigquery.HivePartitioningOptions.from_api_repr({
-                "mode": "AUTO",
-                "sourceUriPrefix": f"gs://{GCS_BUCKET}/{GCS_PREFIX}/",
-            }),
-        ),
+def create_external_table():
+    sql = f"""
+    CREATE OR REPLACE EXTERNAL TABLE `{OUTPUT_TABLE}`
+    WITH PARTITION COLUMNS
+    OPTIONS (
+      format = 'PARQUET',
+      uris = ['gs://{GCS_BUCKET}/{GCS_PREFIX}/*'],
+      hive_partition_uri_prefix = 'gs://{GCS_BUCKET}/{GCS_PREFIX}/',
+      require_hive_partition_filter = false
     )
-    job.result()
-    return job.output_rows
+    """
+    bq().query(sql).result()
+    return OUTPUT_TABLE
 
 # ============================================================================
 # Driver
 # ============================================================================
-def run_one(asset, cleanup=True):
-    t0 = time.time()
-    p_in = download_asset(asset)
-    if p_in is None:
-        print(f"[{asset}] no orderbook data")
-        return
-    t_dl = time.time() - t0
-
-    t1 = time.time()
-    p_out = process_asset(asset)
-    t_proc = time.time() - t1
-    if p_out is None:
-        print(f"[{asset}] dl {t_dl:.1f}s, no valid windows")
-        if cleanup:
-            p_in.unlink(missing_ok=True)
-        return
-
-    t2 = time.time()
-    gs_uri = upload_asset(asset)
-    t_up = time.time() - t2
-
-    if cleanup:
-        p_in.unlink(missing_ok=True)
-        p_out.unlink(missing_ok=True)
-
-    print(f"[{asset}] dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s  → {gs_uri}")
-
 def main(argv):
     if len(argv) < 2:
         print(__doc__)
@@ -279,18 +211,14 @@ def main(argv):
                 run_one(a)
             except Exception as e:
                 print(f"FAILED {a}: {e!r}")
-    elif cmd == "load":
-        n = load_to_bq()
-        print(f"loaded {n:,} rows into {OUTPUT_TABLE}")
-    elif cmd in ("download", "process", "upload", "run"):
+    elif cmd == "external":
+        name = create_external_table()
+        print(f"defined external table {name}")
+    elif cmd == "run":
         if len(argv) < 3:
-            print(f"usage: {argv[0]} {cmd} <asset>")
+            print(f"usage: {argv[0]} run <asset>")
             return
-        asset = argv[2]
-        if   cmd == "download": print(download_asset(asset))
-        elif cmd == "process":  print(process_asset(asset))
-        elif cmd == "upload":   print(upload_asset(asset))
-        elif cmd == "run":      run_one(asset, cleanup=False)
+        run_one(argv[2])
     else:
         print(f"unknown command: {cmd}")
         print(__doc__)
