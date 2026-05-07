@@ -65,30 +65,28 @@ LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", "./data/features"))
 # Algorithm params — fixed, not deployment config
 PREV_N = 300
 POST_N = 500
+# Streaming write: rows of output per row group (and per kernel allocation)
+# 250k × (300+500) × 4 bytes ≈ 800 MB peak per chunk.
+CHUNK_SIZE = 250_000
 
 # ============================================================================
-# Numba kernel
+# Numba kernels
+#
+# Split into two passes so that the (huge) prev/post arrays are only ever
+# allocated for one chunk at a time:
+#   1. find_valid_indices  → returns int64 array of qualifying input row indices.
+#   2. fill_windows_chunk  → fills float32 prev/post for valid_idx[start:stop].
+#
+# Row i qualifies iff there is no NaN in spread[i - prev_n + 1 .. i + post_n - 1]
+# (stricter than the original SQL's boundary-only check).
 # ============================================================================
 @njit(cache=True, boundscheck=False)
-def build_windows(spread, prev_n, post_n):
-    """
-    Single-asset rolling window extraction.
-
-    Row i qualifies iff there is no NaN in spread[i - prev_n + 1 .. i + post_n - 1].
-    For each qualifying row, return (row_idx, prev_window, post_window).
-
-    The original SQL used a looser filter (only the boundary value had to be
-    non-null). This matches the stricter "no null anywhere in window" semantic
-    from the reference snippet.
-    """
+def find_valid_indices(spread, prev_n, post_n):
     n = spread.shape[0]
     if n < prev_n + post_n - 1:
-        return (np.empty(0, np.int64),
-                np.empty((0, prev_n), np.float64),
-                np.empty((0, post_n), np.float64))
+        return np.empty(0, np.int64)
 
     # nan_after[j] = smallest k >= j where spread[k] is NaN, else n.
-    # A row i is valid iff nan_after[i - prev_n + 1] >= i + post_n.
     nan_after = np.empty(n, np.int64)
     last = n
     for j in range(n - 1, -1, -1):
@@ -96,28 +94,31 @@ def build_windows(spread, prev_n, post_n):
             last = j
         nan_after[j] = last
 
-    # Pass 1: count valid rows
     n_out = 0
     for i in range(prev_n - 1, n - post_n + 1):
         if nan_after[i - prev_n + 1] >= i + post_n:
             n_out += 1
 
-    prev_out = np.empty((n_out, prev_n), np.float64)
-    post_out = np.empty((n_out, post_n), np.float64)
-    row_idx  = np.empty(n_out, np.int64)
-
-    # Pass 2: fill outputs
+    out = np.empty(n_out, np.int64)
     k = 0
     for i in range(prev_n - 1, n - post_n + 1):
         if nan_after[i - prev_n + 1] >= i + post_n:
-            for j in range(prev_n):
-                prev_out[k, j] = spread[i - prev_n + 1 + j]
-            for j in range(post_n):
-                post_out[k, j] = spread[i + j]
-            row_idx[k] = i
+            out[k] = i
             k += 1
+    return out
 
-    return row_idx, prev_out, post_out
+@njit(cache=True, boundscheck=False)
+def fill_windows_chunk(spread, valid_idx, start, stop, prev_n, post_n):
+    n_out = stop - start
+    prev_out = np.empty((n_out, prev_n), np.float32)
+    post_out = np.empty((n_out, post_n), np.float32)
+    for k in range(n_out):
+        i = valid_idx[start + k]
+        for j in range(prev_n):
+            prev_out[k, j] = np.float32(spread[i - prev_n + 1 + j])
+        for j in range(post_n):
+            post_out[k, j] = np.float32(spread[i + j])
+    return prev_out, post_out
 
 # ============================================================================
 # Clients (lazy)
@@ -195,48 +196,78 @@ def run_one(asset, local=False):
     _log(asset, f"dl + sort {t_dl:.1f}s")
 
     t1 = time.time()
-    _log(asset, "running numba kernel…")
+    _log(asset, "scanning for valid windows…")
     spread = tbl.column("spread").to_numpy(zero_copy_only=False)
     if spread.dtype != np.float64:
         spread = spread.astype(np.float64)
-    row_idx, prev_w, post_w = build_windows(spread, PREV_N, POST_N)
-    if row_idx.size == 0:
+    valid_idx = find_valid_indices(spread, PREV_N, POST_N)
+    n_valid = valid_idx.size
+    if n_valid == 0:
         _log(asset, f"dl {t_dl:.1f}s, no valid windows")
         return
-    _log(asset, f"  {row_idx.size:,} windows kept of {tbl.num_rows:,} input rows")
-    sliced = tbl.take(pa.array(row_idx))
+    _log(asset, f"  {n_valid:,} windows kept of {tbl.num_rows:,} input rows")
+    sliced = tbl.take(pa.array(valid_idx))
     del tbl
     if "asset" in sliced.column_names:
         sliced = sliced.drop(["asset"])
-    out = sliced.append_column(
-        "prev_30",
-        pa.FixedSizeListArray.from_arrays(pa.array(prev_w.ravel(), pa.float64()), PREV_N),
-    )
-    out = out.append_column(
-        "post_50",
-        pa.FixedSizeListArray.from_arrays(pa.array(post_w.ravel(), pa.float64()), POST_N),
-    )
     t_proc = time.time() - t1
-    _log(asset, f"proc {t_proc:.1f}s")
+    _log(asset, f"valid-scan + filter {t_proc:.1f}s")
 
-    t2 = time.time()
-    approx_mb = (out.nbytes or 0) / 1e6
+    # Set up the output sink (local tmp file or GCS handle)
     if local:
         dest_path = LOCAL_OUTPUT_DIR / f"asset={asset}" / "data.parquet"
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = dest_path.with_suffix(".parquet.tmp")
+        sink = str(tmp_path)
         dest_uri = str(dest_path)
-        _log(asset, f"writing {out.num_rows:,} rows (~{approx_mb:.0f} MB uncompressed) → {dest_uri}")
-        tmp = dest_path.with_suffix(".parquet.tmp")
-        pq.write_table(out, str(tmp), compression="zstd")
-        tmp.rename(dest_path)
     else:
         remote = f"{GCS_BUCKET}/{GCS_PREFIX}/asset={asset}/data.parquet"
+        sink = fs.open(remote, "wb")
         dest_uri = f"gs://{remote}"
-        _log(asset, f"writing {out.num_rows:,} rows (~{approx_mb:.0f} MB uncompressed) → {dest_uri}")
-        with fs.open(remote, "wb") as f:
-            pq.write_table(out, f, compression="zstd")
+
+    approx_mb_total = n_valid * (PREV_N + POST_N) * 4 / 1e6   # float32
+    n_chunks = (n_valid + CHUNK_SIZE - 1) // CHUNK_SIZE
+    _log(asset, f"writing {n_valid:,} rows in {n_chunks} chunk(s) of {CHUNK_SIZE:,} (~{approx_mb_total:.0f} MB uncompressed total) → {dest_uri}")
+
+    t2 = time.time()
+    writer = None
+    try:
+        for chunk_start in range(0, n_valid, CHUNK_SIZE):
+            chunk_stop = min(chunk_start + CHUNK_SIZE, n_valid)
+            n_chunk = chunk_stop - chunk_start
+            prev_chunk, post_chunk = fill_windows_chunk(
+                spread, valid_idx, chunk_start, chunk_stop, PREV_N, POST_N
+            )
+            chunk_tbl = (
+                sliced.slice(chunk_start, n_chunk)
+                .append_column(
+                    "prev_30",
+                    pa.FixedSizeListArray.from_arrays(
+                        pa.array(prev_chunk.ravel(), pa.float32()), PREV_N
+                    ),
+                )
+                .append_column(
+                    "post_50",
+                    pa.FixedSizeListArray.from_arrays(
+                        pa.array(post_chunk.ravel(), pa.float32()), POST_N
+                    ),
+                )
+            )
+            if writer is None:
+                writer = pq.ParquetWriter(sink, chunk_tbl.schema, compression="zstd")
+            writer.write_table(chunk_tbl)
+            _log(asset, f"  wrote {chunk_stop:,}/{n_valid:,} rows")
+    finally:
+        if writer is not None:
+            writer.close()
+        if not local:
+            sink.close()
+
+    if local:
+        tmp_path.rename(dest_path)
+
     t_up = time.time() - t2
-    _log(asset, f"up {t_up:.1f}s  ({approx_mb / max(t_up, 0.1):.0f} MB/s) → {dest_uri}")
+    _log(asset, f"up {t_up:.1f}s  ({approx_mb_total / max(t_up, 0.1):.0f} MB/s) → {dest_uri}")
     _log(asset, f"DONE  dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s")
 
 # ============================================================================
