@@ -17,6 +17,8 @@ Commands:
     all                 run for every asset, sequentially
     external            CREATE OR REPLACE EXTERNAL TABLE over the features Parquets
     list                print all distinct assets present in the GCS source
+    inspect   <asset>   dump the Parquet schema of every partition file for an
+                        asset and flag any cross-file schema differences (debug)
 
 The features Parquets are written Hive-partitioned by asset:
     gs://<GCS_BUCKET>/<GCS_PREFIX>/asset=<A>/data.parquet
@@ -161,7 +163,11 @@ def run_one(asset):
     if not files:
         print(f"[{asset}] no orderbook data")
         return
-    tables = [_normalize_trade_date(pq.read_table(f, filesystem=fs)) for f in files]
+    # ParquetFile bypasses pq.read_table's default partitioning="hive" — the
+    # `trade_date=…/asset=…` path would otherwise be auto-discovered, adding a
+    # dictionary<string> trade_date column that collides with the date32 column
+    # already in the file.
+    tables = [_normalize_trade_date(pq.ParquetFile(f, filesystem=fs).read()) for f in files]
     tbl = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
     tbl = tbl.sort_by([("nanoseconds_start", "ascending"), ("seq_nbr", "ascending")])
     t_dl = time.time() - t0
@@ -194,6 +200,39 @@ def run_one(asset):
     t_up = time.time() - t2
 
     print(f"[{asset}] dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s  → gs://{remote}")
+
+# ============================================================================
+# Inspect:  dump per-file Parquet schemas, surface cross-file mismatches
+# ============================================================================
+def inspect_asset(asset):
+    fs = gcs()
+    files = fs.glob(f"{SOURCE_BUCKET}/{SOURCE_PREFIX}/trade_date=*/asset={asset}/*.parquet")
+    if not files:
+        print(f"[{asset}] no files")
+        return
+    print(f"[{asset}] {len(files)} file(s)")
+
+    schemas = {}   # str(schema) -> list[path]
+    for f in files:
+        pf = pq.ParquetFile(f, filesystem=fs)
+        s = pf.schema_arrow
+        nrows = pf.metadata.num_rows
+        key = "\n".join(f"  {fld.name}: {fld.type}" for fld in s)
+        schemas.setdefault(key, []).append((f, nrows))
+
+    for i, (key, members) in enumerate(schemas.items(), 1):
+        total_rows = sum(n for _, n in members)
+        print(f"\n--- schema #{i}  ({len(members)} files, {total_rows:,} rows) ---")
+        print(key)
+        for f, n in members[:3]:
+            print(f"  e.g. {f} ({n:,} rows)")
+        if len(members) > 3:
+            print(f"  ... and {len(members) - 3} more")
+
+    if len(schemas) > 1:
+        print(f"\nWARNING: {len(schemas)} distinct schemas across files for {asset}")
+    else:
+        print(f"\nOK: all files share one schema")
 
 # ============================================================================
 # External table:  CREATE OR REPLACE EXTERNAL TABLE over the GCS features
@@ -237,6 +276,11 @@ def main(argv):
             print(f"usage: {argv[0]} run <asset>")
             return
         run_one(argv[2])
+    elif cmd == "inspect":
+        if len(argv) < 3:
+            print(f"usage: {argv[0]} inspect <asset>")
+            return
+        inspect_asset(argv[2])
     else:
         print(f"unknown command: {cmd}")
         print(__doc__)
