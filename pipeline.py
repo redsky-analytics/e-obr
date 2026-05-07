@@ -138,6 +138,21 @@ def list_assets():
 # ============================================================================
 # Per-asset pipeline:  GCS Parquet → numba kernel → GCS features Parquet
 # ============================================================================
+def _normalize_trade_date(t):
+    """BigQuery's Parquet export sometimes writes trade_date as dictionary<string>
+    instead of date32[day], which makes concat_tables across partitions fail. Cast
+    everything to date32 before merging."""
+    if "trade_date" not in t.column_names:
+        return t
+    col = t.column("trade_date")
+    if col.type == pa.date32():
+        return t
+    return t.set_column(
+        t.schema.get_field_index("trade_date"),
+        "trade_date",
+        col.cast(pa.date32()),
+    )
+
 def run_one(asset):
     fs = gcs()
 
@@ -146,7 +161,7 @@ def run_one(asset):
     if not files:
         print(f"[{asset}] no orderbook data")
         return
-    tables = [pq.read_table(f, filesystem=fs) for f in files]
+    tables = [_normalize_trade_date(pq.read_table(f, filesystem=fs)) for f in files]
     tbl = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
     tbl = tbl.sort_by([("nanoseconds_start", "ascending"), ("seq_nbr", "ascending")])
     t_dl = time.time() - t0
