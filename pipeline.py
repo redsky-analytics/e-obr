@@ -20,6 +20,10 @@ Commands:
     inspect   <asset>   dump the Parquet schema of every partition file for an
                         asset and flag any cross-file schema differences (debug)
 
+Flags:
+    --local             write features to LOCAL_OUTPUT_DIR/asset=<A>/data.parquet
+                        instead of GCS (works for `run` and `all`)
+
 The features Parquets are written Hive-partitioned by asset:
     gs://<GCS_BUCKET>/<GCS_PREFIX>/asset=<A>/data.parquet
 The `asset` column is omitted from the file payload — BigQuery's hive partition
@@ -30,6 +34,7 @@ collision an external table would otherwise reject.
 import os
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pyarrow as pa
@@ -53,6 +58,9 @@ SOURCE_PREFIX    = os.environ.get("SOURCE_PREFIX", "downsampled_orderbook")
 # Output: features Parquet (queried via the external table)
 GCS_BUCKET       = os.environ.get("GCS_BUCKET", SOURCE_BUCKET)
 GCS_PREFIX       = os.environ.get("GCS_PREFIX", "orderbook_windows")
+
+# Optional local output destination (used when --local is passed)
+LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", "./data/features"))
 
 # Algorithm params — fixed, not deployment config
 PREV_N = 300
@@ -155,32 +163,49 @@ def _normalize_trade_date(t):
         col.cast(pa.date32()),
     )
 
-def run_one(asset):
+def _log(asset, msg):
+    print(f"[{asset}] {msg}", flush=True)
+
+def run_one(asset, local=False):
     fs = gcs()
 
-    t0 = time.time()
+    _log(asset, "glob source partitions…")
     files = fs.glob(f"{SOURCE_BUCKET}/{SOURCE_PREFIX}/trade_date=*/asset={asset}/*.parquet")
     if not files:
-        print(f"[{asset}] no orderbook data")
+        _log(asset, "no orderbook data")
         return
+    _log(asset, f"{len(files)} partition file(s)")
+
+    t0 = time.time()
     # ParquetFile bypasses pq.read_table's default partitioning="hive" — the
     # `trade_date=…/asset=…` path would otherwise be auto-discovered, adding a
     # dictionary<string> trade_date column that collides with the date32 column
     # already in the file.
-    tables = [_normalize_trade_date(pq.ParquetFile(f, filesystem=fs).read()) for f in files]
+    tables = []
+    for i, f in enumerate(files, 1):
+        t = _normalize_trade_date(pq.ParquetFile(f, filesystem=fs).read())
+        tables.append(t)
+        _log(asset, f"  read {i}/{len(files)}  ({t.num_rows:,} rows)")
+    total_rows = sum(t.num_rows for t in tables)
+    _log(asset, f"concat + sort {total_rows:,} rows…")
     tbl = pa.concat_tables(tables) if len(tables) > 1 else tables[0]
+    del tables
     tbl = tbl.sort_by([("nanoseconds_start", "ascending"), ("seq_nbr", "ascending")])
     t_dl = time.time() - t0
+    _log(asset, f"dl + sort {t_dl:.1f}s")
 
     t1 = time.time()
+    _log(asset, "running numba kernel…")
     spread = tbl.column("spread").to_numpy(zero_copy_only=False)
     if spread.dtype != np.float64:
         spread = spread.astype(np.float64)
     row_idx, prev_w, post_w = build_windows(spread, PREV_N, POST_N)
     if row_idx.size == 0:
-        print(f"[{asset}] dl {t_dl:.1f}s, no valid windows")
+        _log(asset, f"dl {t_dl:.1f}s, no valid windows")
         return
+    _log(asset, f"  {row_idx.size:,} windows kept of {tbl.num_rows:,} input rows")
     sliced = tbl.take(pa.array(row_idx))
+    del tbl
     if "asset" in sliced.column_names:
         sliced = sliced.drop(["asset"])
     out = sliced.append_column(
@@ -192,14 +217,27 @@ def run_one(asset):
         pa.FixedSizeListArray.from_arrays(pa.array(post_w.ravel(), pa.float64()), POST_N),
     )
     t_proc = time.time() - t1
+    _log(asset, f"proc {t_proc:.1f}s")
 
     t2 = time.time()
-    remote = f"{GCS_BUCKET}/{GCS_PREFIX}/asset={asset}/data.parquet"
-    with fs.open(remote, "wb") as f:
-        pq.write_table(out, f, compression="zstd")
+    approx_mb = (out.nbytes or 0) / 1e6
+    if local:
+        dest_path = LOCAL_OUTPUT_DIR / f"asset={asset}" / "data.parquet"
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_uri = str(dest_path)
+        _log(asset, f"writing {out.num_rows:,} rows (~{approx_mb:.0f} MB uncompressed) → {dest_uri}")
+        tmp = dest_path.with_suffix(".parquet.tmp")
+        pq.write_table(out, str(tmp), compression="zstd")
+        tmp.rename(dest_path)
+    else:
+        remote = f"{GCS_BUCKET}/{GCS_PREFIX}/asset={asset}/data.parquet"
+        dest_uri = f"gs://{remote}"
+        _log(asset, f"writing {out.num_rows:,} rows (~{approx_mb:.0f} MB uncompressed) → {dest_uri}")
+        with fs.open(remote, "wb") as f:
+            pq.write_table(out, f, compression="zstd")
     t_up = time.time() - t2
-
-    print(f"[{asset}] dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s  → gs://{remote}")
+    _log(asset, f"up {t_up:.1f}s  ({approx_mb / max(t_up, 0.1):.0f} MB/s) → {dest_uri}")
+    _log(asset, f"DONE  dl {t_dl:.1f}s  proc {t_proc:.1f}s  up {t_up:.1f}s")
 
 # ============================================================================
 # Inspect:  dump per-file Parquet schemas, surface cross-file mismatches
@@ -255,6 +293,9 @@ def create_external_table():
 # Driver
 # ============================================================================
 def main(argv):
+    local = "--local" in argv
+    argv = [a for a in argv if a != "--local"]
+
     if len(argv) < 2:
         print(__doc__)
         return
@@ -263,19 +304,23 @@ def main(argv):
         for a in list_assets():
             print(a)
     elif cmd == "all":
-        for a in list_assets():
+        assets = list_assets()
+        dest = "local disk" if local else "GCS"
+        print(f"[all] {len(assets)} assets ({dest}): {', '.join(assets)}", flush=True)
+        for n, a in enumerate(assets, 1):
+            print(f"\n[all] === {n}/{len(assets)}: {a} ===", flush=True)
             try:
-                run_one(a)
+                run_one(a, local=local)
             except Exception as e:
-                print(f"FAILED {a}: {e!r}")
+                print(f"FAILED {a}: {e!r}", flush=True)
     elif cmd == "external":
         name = create_external_table()
         print(f"defined external table {name}")
     elif cmd == "run":
         if len(argv) < 3:
-            print(f"usage: {argv[0]} run <asset>")
+            print(f"usage: {argv[0]} run <asset> [--local]")
             return
-        run_one(argv[2])
+        run_one(argv[2], local=local)
     elif cmd == "inspect":
         if len(argv) < 3:
             print(f"usage: {argv[0]} inspect <asset>")
