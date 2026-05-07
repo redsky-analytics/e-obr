@@ -1,0 +1,6 @@
+numpy
+numba
+pyarrow
+gcsfs
+google-cloud-bigquery
+google-cloud-bigquery-storage
