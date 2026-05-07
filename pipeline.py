@@ -25,6 +25,7 @@ discovery re-attaches it from the path, which avoids the partition/column name
 collision an external table would otherwise reject.
 """
 
+import os
 import sys
 import time
 
@@ -36,20 +37,22 @@ from numba import njit
 from google.cloud import bigquery
 
 # ============================================================================
-# CONFIG  — edit these
+# CONFIG  — env-driven
 # ============================================================================
-PROJECT          = "your_project"
-LOCATION         = "US"
-OUTPUT_TABLE     = "your_project.your_dataset.Orderbook_Windows"
+BQ_DATASET       = os.environ["BQ_DATASET"]                                # "project.dataset"
+PROJECT          = BQ_DATASET.split(".", 1)[0]
+LOCATION         = os.environ.get("BQ_LOCATION", "US")
+OUTPUT_TABLE     = f"{BQ_DATASET}.Orderbook_Windows"
 
 # Input: Hive-partitioned Parquet written by export_example.sql
-SOURCE_BUCKET    = "bkt-pr-usc1-use5-2664-cdrdsml-dflt"
-SOURCE_PREFIX    = "downsampled_orderbook"
+SOURCE_BUCKET    = os.environ["SOURCE_BUCKET"]
+SOURCE_PREFIX    = os.environ.get("SOURCE_PREFIX", "downsampled_orderbook")
 
-# Output: features Parquet (consumed by the final BQ load)
-GCS_BUCKET       = "your_bucket"
-GCS_PREFIX       = "orderbook_windows"
+# Output: features Parquet (queried via the external table)
+GCS_BUCKET       = os.environ.get("GCS_BUCKET", SOURCE_BUCKET)
+GCS_PREFIX       = os.environ.get("GCS_PREFIX", "orderbook_windows")
 
+# Algorithm params — fixed, not deployment config
 PREV_N = 300
 POST_N = 500
 
